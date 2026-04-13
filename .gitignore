@@ -11,3 +11,12 @@ kontarawa
 # Logs / temp
 *.log
 tmp/
+.env
+
+# Memory: ignore personal knowledge/lessons by default
+memory/knowledge/**
+memory/lessons/**
+
+# Keep README files tracked
+!memory/knowledge/**/README.md
+!memory/lessons/**/README.md
