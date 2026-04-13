@@ -1,0 +1,13 @@
+# Binaries
+kontarawa
+*.exe
+*.out
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+tmp/
