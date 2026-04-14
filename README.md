@@ -38,3 +38,23 @@ go build -o kontarawa ./cmd/kontarawa
 ./kontarawa learn --prompt "..." --bad "..." --good "..." --why "..."
 ```
 
+### VS Code как "полноценный агент" (через MCP)
+Самый простой способ подключить `kontarawa` к агентным расширениям VS Code (Continue/Cline/Roo и др.) — запустить MCP-сервер, который проксирует вызовы в твой `./kontarawa`.
+
+1) Собрать MCP-сервер:
+```bash
+go build -o kontarawa-mcp ./cmd/kontarawa-mcp
+```
+
+2) Запустить (stdio):
+```bash
+./kontarawa-mcp
+```
+
+Сервер отдаёт tools:
+- `kontarawa_ask` (аргумент `prompt`)
+- `kontarawa_doctor`
+- `kontarawa_learn` (аргументы `prompt`, `bad`, `good`, `why`)
+
+Примечание: по умолчанию MCP-сервер вызывает `./kontarawa` из текущей папки. Если агент запускает сервер из другого cwd, передавай `kontarawa_path` в аргументах tool-call.
+
