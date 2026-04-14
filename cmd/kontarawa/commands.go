@@ -48,11 +48,7 @@ func cmdAsk(args []string) {
 	host := ollamaHost()
 	store := memory.New(memoryRoot())
 	profileText := store.ReadProfile()
-	memDocs := store.LoadDocs()
-	docs := make([]retrieval.Doc, 0, len(memDocs))
-	for _, d := range memDocs {
-		docs = append(docs, retrieval.Doc{DocID: d.DocID, Text: d.Text})
-	}
+	docs := retrieval.FromMemoryDocs(store.LoadDocs())
 	retrieved := retrieval.Retrieve(question, docs, *k)
 
 	system := prompt.BuildSystem(profileText, retrieved)
@@ -74,7 +70,7 @@ func cmdAsk(args []string) {
 
 func cmdLearn(args []string) {
 	fs := mustNewFlagSet("learn")
-	prompt := fs.String("prompt", "", "Original prompt/task")
+	taskPrompt := fs.String("prompt", "", "Original prompt/task")
 	bad := fs.String("bad", "", "Bad answer")
 	good := fs.String("good", "", "Good answer")
 	why := fs.String("why", "", "Why the good answer is better")
@@ -83,14 +79,14 @@ func cmdLearn(args []string) {
 		os.Exit(2)
 	}
 
-	if strings.TrimSpace(*prompt) == "" || strings.TrimSpace(*bad) == "" || strings.TrimSpace(*good) == "" {
+	if strings.TrimSpace(*taskPrompt) == "" || strings.TrimSpace(*bad) == "" || strings.TrimSpace(*good) == "" {
 		fmt.Fprintln(os.Stderr, "learn requires --prompt, --bad, --good")
 		os.Exit(2)
 	}
 
 	store := memory.New(memoryRoot())
 	store.EnsureDirs()
-	path, err := store.SaveLesson(*prompt, *bad, *good, *why, memory.SplitTags(*tags))
+	path, err := store.SaveLesson(*taskPrompt, *bad, *good, *why, memory.SplitTags(*tags))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
