@@ -82,6 +82,21 @@ type toolCallResult struct {
 	IsError bool                    `json:"isError,omitempty"`
 }
 
+type setLevelParams struct {
+	Level string `json:"level"`
+}
+
+type loggingMessageParams struct {
+	Level  string `json:"level"`
+	Logger string `json:"logger,omitempty"`
+	Data   any    `json:"data"`
+}
+
+// MCP logging notifications are optional; keep them off by default so running
+// the server manually doesn't spam stdout with JSON. They get enabled when the
+// client sends logging/setLevel (common for MCP clients).
+var mcpLogNotificationsEnabled bool
+
 func main() {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)
@@ -90,6 +105,19 @@ func main() {
 
 	var initialized bool
 	var protocolVersion string
+	logLevel := "info"
+	loggerName := "kontarawa-mcp"
+
+	// Stdio transport: no port. Emit a startup log immediately (some clients show it).
+	cwd, _ := os.Getwd()
+	// Console log is always fine; MCP JSON notifications are gated.
+	writeConsoleLog("info", loggerName, "server started", map[string]any{
+		"transport": "stdio",
+		"port":      nil,
+		"pid":       os.Getpid(),
+		"cwd":       cwd,
+		"argv0":     os.Args[0],
+	})
 
 	for {
 		var req jsonrpcRequest
@@ -121,6 +149,7 @@ func main() {
 			res := initializeResult{
 				ProtocolVersion: protocolVersion,
 				Capabilities: map[string]any{
+					"logging": map[string]any{},
 					"tools": map[string]any{
 						"listChanged": false,
 					},
@@ -139,10 +168,24 @@ Use these tools to interact with the local kontarawa agent.
 `),
 			}
 			initialized = true
+			writeLog(enc, logLevel, "info", loggerName, "initialized (protocolVersion="+protocolVersion+")")
 			writeResult(enc, req.ID, res)
 
 		case "ping":
 			writeResult(enc, req.ID, map[string]any{})
+
+		case "logging/setLevel":
+			var p setLevelParams
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				writeError(enc, req.ID, -32602, "Invalid params", err.Error())
+				continue
+			}
+			if p.Level != "" {
+				logLevel = p.Level
+			}
+			mcpLogNotificationsEnabled = true
+			writeResult(enc, req.ID, map[string]any{})
+			writeLog(enc, logLevel, "info", loggerName, "log level set to "+logLevel)
 
 		case "tools/list":
 			if !initialized {
@@ -222,10 +265,21 @@ Use these tools to interact with the local kontarawa agent.
 				continue
 			}
 
-			out, isErr, err := handleToolCall(p)
+			start := time.Now()
+			writeLog(enc, logLevel, "info", loggerName, "tools/call "+p.Name+" start")
+			out, isErr, err := handleToolCall(p, func(level, msg string, data any) {
+				writeLog(enc, logLevel, level, loggerName, msg, data)
+			})
 			if err != nil {
+				writeLog(enc, logLevel, "error", loggerName, "tools/call "+p.Name+" failed", err.Error())
 				writeError(enc, req.ID, -32000, "Tool execution failed", err.Error())
 				continue
+			}
+			dur := time.Since(start)
+			if isErr {
+				writeLog(enc, logLevel, "warning", loggerName, "tools/call "+p.Name+" finished (tool error)", map[string]any{"duration_ms": dur.Milliseconds()})
+			} else {
+				writeLog(enc, logLevel, "info", loggerName, "tools/call "+p.Name+" finished", map[string]any{"duration_ms": dur.Milliseconds()})
 			}
 			writeResult(enc, req.ID, toolCallResult{
 				Content: []toolResultContentText{{Type: "text", Text: out}},
@@ -238,7 +292,9 @@ Use these tools to interact with the local kontarawa agent.
 	}
 }
 
-func handleToolCall(p toolCallParams) (string, bool, error) {
+type logFn func(level, msg string, data any)
+
+func handleToolCall(p toolCallParams, log logFn) (string, bool, error) {
 	switch p.Name {
 	case "kontarawa_ask":
 		prompt, _ := p.Arguments["prompt"].(string)
@@ -246,11 +302,11 @@ func handleToolCall(p toolCallParams) (string, bool, error) {
 			return "missing required argument: prompt", true, nil
 		}
 		kPath := kontarawaPathFromArgs(p.Arguments)
-		return runKontarawa([]string{"ask", prompt}, kPath)
+		return runKontarawa([]string{"ask", prompt}, kPath, log)
 
 	case "kontarawa_doctor":
 		kPath := kontarawaPathFromArgs(p.Arguments)
-		return runKontarawa([]string{"doctor"}, kPath)
+		return runKontarawa([]string{"doctor"}, kPath, log)
 
 	case "kontarawa_learn":
 		get := func(k string) string {
@@ -272,7 +328,7 @@ func handleToolCall(p toolCallParams) (string, bool, error) {
 			"--good", good,
 			"--why", why,
 		}
-		return runKontarawa(args, kPath)
+		return runKontarawa(args, kPath, log)
 	default:
 		return fmt.Sprintf("unknown tool: %s", p.Name), true, nil
 	}
@@ -290,7 +346,7 @@ func kontarawaPathFromArgs(args map[string]any) string {
 	return ""
 }
 
-func runKontarawa(args []string, kontarawaPath string) (string, bool, error) {
+func runKontarawa(args []string, kontarawaPath string, log logFn) (string, bool, error) {
 	kPath := kontarawaPath
 	if kPath == "" {
 		kPath = "./kontarawa"
@@ -308,6 +364,9 @@ func runKontarawa(args []string, kontarawaPath string) (string, bool, error) {
 
 	cmd := exec.CommandContext(ctx, kPath, args...)
 	cmd.Env = os.Environ()
+	if log != nil {
+		log("debug", "exec", map[string]any{"path": kPath, "args": args})
+	}
 
 	// Capture both streams (kontarawa may log to stderr).
 	outBytes, err := cmd.CombinedOutput()
@@ -333,6 +392,86 @@ func writeResult(enc *json.Encoder, id requestID, result any) {
 		ID:      id,
 		Result:  result,
 	})
+}
+
+func writeLog(enc *json.Encoder, currentLevel string, level string, logger string, message string, data ...any) {
+	if !logEnabled(currentLevel, level) {
+		return
+	}
+	var payload any = message
+	if len(data) == 1 {
+		payload = map[string]any{"message": message, "data": data[0]}
+	} else if len(data) > 1 {
+		payload = map[string]any{"message": message, "data": data}
+	}
+
+	// Human-friendly logs to stderr for local debugging.
+	writeConsoleLog(level, logger, message, data...)
+
+	// MCP logs to stdout (JSON-RPC notification), only if enabled.
+	if !mcpLogNotificationsEnabled {
+		return
+	}
+	_ = enc.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"method": "notifications/message",
+		"params": loggingMessageParams{
+			Level:  level,
+			Logger: logger,
+			Data:   payload,
+		},
+	})
+}
+
+func writeConsoleLog(level string, logger string, message string, data ...any) {
+	ts := time.Now().Format(time.RFC3339)
+	line := fmt.Sprintf("%s %-9s %s: %s", ts, strings.ToUpper(level), logger, message)
+	if len(data) == 0 {
+		fmt.Fprintln(os.Stderr, line)
+		return
+	}
+
+	// Pretty-print structured data when possible.
+	var extra any
+	if len(data) == 1 {
+		extra = data[0]
+	} else {
+		extra = data
+	}
+	b, err := json.MarshalIndent(extra, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, line, fmt.Sprintf("(%v)", extra))
+		return
+	}
+	fmt.Fprintln(os.Stderr, line)
+	fmt.Fprintln(os.Stderr, string(b))
+}
+
+func logEnabled(currentLevel string, msgLevel string) bool {
+	// RFC-5424-ish ordering (MCP levels): debug < info < notice < warning < error < critical < alert < emergency
+	order := func(l string) int {
+		switch strings.ToLower(l) {
+		case "debug":
+			return 0
+		case "info":
+			return 1
+		case "notice":
+			return 2
+		case "warning":
+			return 3
+		case "error":
+			return 4
+		case "critical":
+			return 5
+		case "alert":
+			return 6
+		case "emergency":
+			return 7
+		default:
+			return 1
+		}
+	}
+	return order(msgLevel) >= order(currentLevel)
 }
 
 func writeError(enc *json.Encoder, id requestID, code int, message string, data any) {
