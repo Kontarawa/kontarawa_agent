@@ -1,5 +1,6 @@
 # Binaries
 kontarawa
+kontarawa-mcp
 *.exe
 *.out
 
